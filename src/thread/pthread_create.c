@@ -19,6 +19,12 @@ weak_alias(dummy_0, __pthread_tsd_run_dtors);
 weak_alias(dummy_0, __do_orphaned_stdio_locks);
 weak_alias(dummy_0, __dl_thread_cleanup);
 
+static void *dummy_1(void *p)
+{
+	return 0;
+}
+weak_alias(dummy_1, __start_sched);
+
 _Noreturn void __pthread_exit(void *result)
 {
 	pthread_t self = __pthread_self();
@@ -135,19 +141,6 @@ void __do_cleanup_pop(struct __ptcb *cb)
 static int start(void *p)
 {
 	pthread_t self = p;
-	/* States for startlock:
-	 * 0 = no need for start sync
-	 * 1 = waiting for parent to do work
-	 * 2 = failure in parent, child must abort
-	 * 3 = success in parent, child must restore sigmask */
-	if (self->startlock[0]) {
-		__wait(self->startlock, 0, 1, 1);
-		if (self->startlock[0] == 2) {
-			self->detach_state = DT_DYNAMIC;
-			pthread_exit(0);
-		}
-		__restore_sigs(self->sigmask);
-	}
 	if (self->unblock_cancel)
 		__syscall(SYS_rt_sigprocmask, SIG_UNBLOCK,
 			SIGPT_SET, 0, _NSIG/8);
@@ -172,8 +165,8 @@ static void *dummy_tsd[1] = { 0 };
 weak_alias(dummy_tsd, __pthread_tsd_main);
 
 volatile int __block_new_threads = 0;
-size_t __default_stacksize = DEFAULT_STACK_SIZE;
-size_t __default_guardsize = DEFAULT_GUARD_SIZE;
+extern size_t __default_stacksize;
+extern size_t __default_guardsize;
 
 static FILE *volatile dummy_file = 0;
 weak_alias(dummy_file, __stdin_used);
@@ -198,6 +191,7 @@ int __pthread_create(pthread_t *restrict res, const pthread_attr_t *restrict att
 		| CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_DETACHED;
 	int do_sched = 0;
 	pthread_attr_t attr = { 0 };
+	struct start_sched_args ssa;
 
 	if (!libc.can_do_threads) return ENOSYS;
 	self = __pthread_self();
@@ -282,8 +276,14 @@ int __pthread_create(pthread_t *restrict res, const pthread_attr_t *restrict att
 		new->detach_state = DT_JOINABLE;
 	}
 	if (attr._a_sched) {
-		do_sched = new->startlock[0] = 1;
-		__block_app_sigs(new->sigmask);
+		do_sched = 1;
+		ssa.futex = -1;
+		ssa.start_fn = new->start;
+		ssa.start_arg = new->start_arg;
+		ssa.attr = &attr;
+		new->start = __start_sched;
+		new->start_arg = &ssa;
+		__block_app_sigs(&ssa.mask);
 	}
 	new->robust_list.head = &new->robust_list.head;
 	new->unblock_cancel = self->cancel;
@@ -295,7 +295,7 @@ int __pthread_create(pthread_t *restrict res, const pthread_attr_t *restrict att
 	__release_ptc();
 
 	if (do_sched) {
-		__restore_sigs(new->sigmask);
+		__restore_sigs(&ssa.mask);
 	}
 
 	if (ret < 0) {
@@ -305,11 +305,9 @@ int __pthread_create(pthread_t *restrict res, const pthread_attr_t *restrict att
 	}
 
 	if (do_sched) {
-		ret = __syscall(SYS_sched_setscheduler, new->tid,
-			attr._a_policy, &attr._a_prio);
-		a_store(new->startlock, ret<0 ? 2 : 3);
-		__wake(new->startlock, 1, 1);
-		if (ret < 0) return -ret;
+		__futexwait(&ssa.futex, -1, 1);
+		ret = ssa.futex;
+		if (ret) return ret;
 	}
 
 	*res = new;

@@ -385,6 +385,14 @@ static void do_relocs(struct dso *dso, size_t *rel, size_t rel_size, size_t stri
 		sym_val = def.sym ? (size_t)laddr(def.dso, def.sym->st_value) : 0;
 		tls_val = def.sym ? def.sym->st_value : 0;
 
+		if ((type == REL_TPOFF || type == REL_TPOFF_NEG)
+		    && runtime && def.dso->tls_id > static_tls_cnt) {
+			error("Error relocating %s: %s: initial-exec TLS "
+				"resolves to dynamic definition in %s",
+				dso->name, name, def.dso->name);
+			longjmp(*rtld_fail, 1);
+		}
+
 		switch(type) {
 		case REL_NONE:
 			break;
@@ -438,7 +446,7 @@ static void do_relocs(struct dso *dso, size_t *rel, size_t rel_size, size_t stri
 #endif
 		case REL_TLSDESC:
 			if (stride<3) addend = reloc_addr[1];
-			if (runtime && def.dso->tls_id >= static_tls_cnt) {
+			if (runtime && def.dso->tls_id > static_tls_cnt) {
 				struct td_index *new = malloc(sizeof *new);
 				if (!new) {
 					error(
@@ -706,18 +714,17 @@ static void *map_library(int fd, struct dso *dso)
 			dso->phnum = eh->e_phnum;
 			dso->phentsize = eh->e_phentsize;
 		}
-		/* Reuse the existing mapping for the lowest-address LOAD */
-		if ((ph->p_vaddr & -PAGE_SIZE) == addr_min && !DL_NOMMU_SUPPORT)
-			continue;
 		this_min = ph->p_vaddr & -PAGE_SIZE;
 		this_max = ph->p_vaddr+ph->p_memsz+PAGE_SIZE-1 & -PAGE_SIZE;
 		off_start = ph->p_offset & -PAGE_SIZE;
 		prot = (((ph->p_flags&PF_R) ? PROT_READ : 0) |
 			((ph->p_flags&PF_W) ? PROT_WRITE: 0) |
 			((ph->p_flags&PF_X) ? PROT_EXEC : 0));
-		if (mmap_fixed(base+this_min, this_max-this_min, prot, MAP_PRIVATE|MAP_FIXED, fd, off_start) == MAP_FAILED)
-			goto error;
-		if (ph->p_memsz > ph->p_filesz) {
+		/* Reuse the existing mapping for the lowest-address LOAD */
+		if ((ph->p_vaddr & -PAGE_SIZE) != addr_min || DL_NOMMU_SUPPORT)
+			if (mmap_fixed(base+this_min, this_max-this_min, prot, MAP_PRIVATE|MAP_FIXED, fd, off_start) == MAP_FAILED)
+				goto error;
+		if (ph->p_memsz > ph->p_filesz && (ph->p_flags&PF_W)) {
 			size_t brk = (size_t)base+ph->p_vaddr+ph->p_filesz;
 			size_t pgbrk = brk+PAGE_SIZE-1 & -PAGE_SIZE;
 			memset((void *)brk, 0, pgbrk-brk & PAGE_SIZE-1);
@@ -1594,8 +1601,9 @@ _Noreturn void __dls3(size_t *sp)
 		libc.tls_head = tls_tail = &app.tls;
 		app.tls_id = tls_cnt = 1;
 #ifdef TLS_ABOVE_TP
-		app.tls.offset = 0;
-		tls_offset = app.tls.size
+		app.tls.offset = GAP_ABOVE_TP;
+		app.tls.offset += -GAP_ABOVE_TP & (app.tls.align-1);
+		tls_offset = app.tls.offset + app.tls.size
 			+ ( -((uintptr_t)app.tls.image + app.tls.size)
 			& (app.tls.align-1) );
 #else
@@ -1878,8 +1886,17 @@ static void *addr2dso(size_t a)
 					return p;
 			}
 		} else {
+			Phdr *ph = p->phdr;
+			size_t phcnt = p->phnum;
+			size_t entsz = p->phentsize;
+			size_t base = (size_t)p->base;
+			for (; phcnt--; ph=(void *)((char *)ph+entsz)) {
+				if (ph->p_type != PT_LOAD) continue;
+				if (a-base-ph->p_vaddr < ph->p_memsz)
+					return p;
+			}
 			if (a-(size_t)p->map < p->map_len)
-				return p;
+				return 0;
 		}
 	}
 	return 0;
@@ -1943,16 +1960,18 @@ failed:
 	return 0;
 }
 
-int dladdr(const void *addr, Dl_info *info)
+int dladdr(const void *addr_arg, Dl_info *info)
 {
+	size_t addr = (size_t)addr_arg;
 	struct dso *p;
 	Sym *sym, *bestsym;
 	uint32_t nsym;
 	char *strings;
-	void *best = 0;
+	size_t best = 0;
+	size_t besterr = -1;
 
 	pthread_rwlock_rdlock(&lock);
-	p = addr2dso((size_t)addr);
+	p = addr2dso(addr);
 	pthread_rwlock_unlock(&lock);
 
 	if (!p) return 0;
@@ -1962,11 +1981,12 @@ int dladdr(const void *addr, Dl_info *info)
 	nsym = count_syms(p);
 
 	if (DL_FDPIC) {
-		size_t idx = ((size_t)addr-(size_t)p->funcdescs)
+		size_t idx = (addr-(size_t)p->funcdescs)
 			/ sizeof(*p->funcdescs);
 		if (idx < nsym && (sym[idx].st_info&0xf) == STT_FUNC) {
-			best = p->funcdescs + idx;
+			best = (size_t)(p->funcdescs + idx);
 			bestsym = sym + idx;
+			besterr = 0;
 		}
 	}
 
@@ -1974,25 +1994,35 @@ int dladdr(const void *addr, Dl_info *info)
 		if (sym->st_value
 		 && (1<<(sym->st_info&0xf) & OK_TYPES)
 		 && (1<<(sym->st_info>>4) & OK_BINDS)) {
-			void *symaddr = laddr(p, sym->st_value);
-			if (symaddr > addr || symaddr < best)
+			size_t symaddr = (size_t)laddr(p, sym->st_value);
+			if (symaddr > addr || symaddr <= best)
 				continue;
 			best = symaddr;
 			bestsym = sym;
+			besterr = addr - symaddr;
 			if (addr == symaddr)
 				break;
 		}
 	}
 
-	if (!best) return 0;
-
-	if (DL_FDPIC && (bestsym->st_info&0xf) == STT_FUNC)
-		best = p->funcdescs + (bestsym - p->syms);
+	if (bestsym && besterr > bestsym->st_size-1) {
+		best = 0;
+		bestsym = 0;
+	}
 
 	info->dli_fname = p->name;
 	info->dli_fbase = p->map;
+
+	if (!best) {
+		info->dli_sname = 0;
+		info->dli_saddr = 0;
+		return 1;
+	}
+
+	if (DL_FDPIC && (bestsym->st_info&0xf) == STT_FUNC)
+		best = (size_t)(p->funcdescs + (bestsym - p->syms));
 	info->dli_sname = strings + bestsym->st_name;
-	info->dli_saddr = best;
+	info->dli_saddr = (void *)best;
 
 	return 1;
 }

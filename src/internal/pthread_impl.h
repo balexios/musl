@@ -47,8 +47,6 @@ struct pthread {
 	volatile int timer_id;
 	locale_t locale;
 	volatile int killlock[1];
-	volatile int startlock[1];
-	unsigned long sigmask[_NSIG/8/sizeof(long)];
 	char *dlerror_buf;
 	void *stdio_locks;
 
@@ -56,6 +54,14 @@ struct pthread {
 	 * the end of the structure is external and internal ABI. */
 	uintptr_t canary_at_end;
 	void **dtv_copy;
+};
+
+struct start_sched_args {
+	void *start_arg;
+	void *(*start_fn)(void *);
+	sigset_t mask;
+	pthread_attr_t *attr;
+	volatile int futex;
 };
 
 enum {
@@ -155,8 +161,8 @@ static inline void __wake(volatile void *addr, int cnt, int priv)
 static inline void __futexwait(volatile void *addr, int val, int priv)
 {
 	if (priv) priv = FUTEX_PRIVATE;
-	__syscall(SYS_futex, addr, FUTEX_WAIT|priv, val) != -ENOSYS ||
-	__syscall(SYS_futex, addr, FUTEX_WAIT, val);
+	__syscall(SYS_futex, addr, FUTEX_WAIT|priv, val, 0) != -ENOSYS ||
+	__syscall(SYS_futex, addr, FUTEX_WAIT, val, 0);
 }
 
 void __acquire_ptc(void);

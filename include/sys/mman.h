@@ -35,6 +35,7 @@ extern "C" {
 #define MAP_STACK      0x20000
 #define MAP_HUGETLB    0x40000
 #define MAP_SYNC       0x80000
+#define MAP_FIXED_NOREPLACE 0x100000
 #define MAP_FILE       0
 
 #define MAP_HUGE_SHIFT 26
@@ -93,6 +94,17 @@ extern "C" {
 #define MADV_SOFT_OFFLINE 101
 #endif
 
+#ifdef _GNU_SOURCE
+#define MREMAP_MAYMOVE 1
+#define MREMAP_FIXED 2
+
+#define MLOCK_ONFAULT 0x01
+
+#define MFD_CLOEXEC 0x0001U
+#define MFD_ALLOW_SEALING 0x0002U
+#define MFD_HUGETLB 0x0004U
+#endif
+
 #include <bits/mman.h>
 
 void *mmap (void *, size_t, int, int, int, off_t);
@@ -109,14 +121,13 @@ int mlockall (int);
 int munlockall (void);
 
 #ifdef _GNU_SOURCE
-#define MREMAP_MAYMOVE 1
-#define MREMAP_FIXED 2
 void *mremap (void *, size_t, size_t, int, ...);
 int remap_file_pages (void *, size_t, int, size_t, int);
+int memfd_create (const char *, unsigned);
+int mlock2 (const void *, size_t, unsigned);
 #endif
 
 #if defined(_GNU_SOURCE) || defined(_BSD_SOURCE)
-#define MLOCK_ONFAULT   0x01
 int madvise (void *, size_t, int);
 int mincore (void *, size_t, unsigned char *);
 #endif
